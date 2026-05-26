@@ -185,8 +185,40 @@ async function findOutEndpoint(device: USBDevice): Promise<{ ep: number; iface: 
   throw new Error('Endpoint OUT (bulk) não encontrado no device USB.');
 }
 
+/**
+ * Abre o device com retry/backoff em "Access denied".
+ *
+ * Por que retry?
+ *   - No Windows, o driver/spooler da Zebra costuma reclamar o device por algumas
+ *     centenas de ms após um print job terminar. O próximo open() vindo do WebUSB
+ *     bate em "Access denied" mesmo que o usuário tenha permissão.
+ *   - Outras causas transientes: close() anterior ainda em andamento, ou device
+ *     ainda completando um ciclo de reset USB pós-print.
+ *   - Backoff exponencial leve resolve a maioria dos casos sem prejudicar UX.
+ */
+async function openWithRetry(device: USBDevice): Promise<void> {
+  const delays = [0, 200, 400, 800];
+  let lastErr: unknown;
+  for (const wait of delays) {
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      await device.open();
+      return;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // Só vale retry pra "access denied" / "busy". Outros erros (NotFound,
+      // SecurityError, etc.) não vão melhorar com espera.
+      if (!/access denied|in use|busy/i.test(msg)) throw err;
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error('Falha ao abrir o device USB após múltiplas tentativas.');
+}
+
 async function openAndClaim(device: USBDevice): Promise<DeviceHandle> {
-  if (!device.opened) await device.open();
+  if (!device.opened) await openWithRetry(device);
   if (!device.configuration) await device.selectConfiguration(1);
   const { ep, iface } = await findOutEndpoint(device);
   try {
@@ -200,8 +232,10 @@ async function openAndClaim(device: USBDevice): Promise<DeviceHandle> {
 async function releaseHandle(handle: DeviceHandle | null) {
   if (!handle) return;
   try {
-    await handle.device.releaseInterface(handle.interfaceNumber).catch(() => {});
-    await handle.device.close().catch(() => {});
+    if (handle.device.opened) {
+      await handle.device.releaseInterface(handle.interfaceNumber).catch(() => {});
+      await handle.device.close().catch(() => {});
+    }
   } catch {
     /* noop */
   }
@@ -332,10 +366,15 @@ export function useZebraPrinter(): UseZebraPrinterReturn {
     if (!target) {
       throw new Error('Nenhuma impressora pareada. Adicione uma em "Configurações de impressão".');
     }
-    // Se já há handle aberto e é o mesmo device, reusa.
-    if (activeHandle && activeHandle.device === target) return activeHandle;
-    // Trocou de device — libera o anterior antes.
+    // Reusa só se for o MESMO device E ele ainda estiver aberto.
+    // O `opened` pode virar false sem nosso código tocar nele: driver Windows reivindica,
+    // outra aba abre, USB reset pós-print, etc. Nesse caso o handle é stale e precisa reabrir.
+    if (activeHandle && activeHandle.device === target && activeHandle.device.opened) {
+      return activeHandle;
+    }
+    // Stale ou device diferente — libera tudo e abre do zero.
     await releaseHandle(activeHandle);
+    activeHandle = null;
     activeHandle = await openAndClaim(target);
     return activeHandle;
   }, [resolveSelectedDevice]);
@@ -467,7 +506,15 @@ export function useZebraPrinter(): UseZebraPrinterReturn {
         safeSet(setStatus, 'connected');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/(disconnected|transfer.*failed|stall|NotFoundError|InvalidStateError)/i.test(msg)) {
+        // Qualquer erro que indique handle inválido/perdido — limpa pra próximo print reabrir.
+        // "Access denied" entra aqui: significa que o sistema (driver) reivindicou o device,
+        // então não adianta reusar o handle atual.
+        if (
+          /(disconnected|transfer.*failed|stall|NotFoundError|InvalidStateError|access denied|in use|busy)/i.test(
+            msg,
+          )
+        ) {
+          await releaseHandle(activeHandle);
           activeHandle = null;
         }
         safeSet(setError, msg);
